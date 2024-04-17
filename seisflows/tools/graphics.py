@@ -173,9 +173,13 @@ def plot_waveforms(tr_obs, tr_syn, tr_adj=None, fid_out=None, title=None,
         lines += twax.plot(tr_adj.times(), tr_adj.data, c=adj_color, lw=lw,
                            label="adj", ls="--", alpha=0.75, zorder=5)
         twax.set_ylabel("Adj. Amplitude")
+        twax_ylim = max(abs(tr_adj.data.min()), abs(tr_adj.data.max()))
+        twax.set_ylim([-1 * twax_ylim, twax_ylim])
 
     # Set the x-axis limits based on syn, which is what we are interested in
     ax.set_xlim([tr_syn.times()[0], tr_syn.times()[-1]])
+    ax_ylim = max(abs(tr_syn.data.min()), abs(tr_syn.data.max()))
+    ax.set_ylim([-1 * ax_ylim, ax_ylim])
 
     # Plot attributes and labels
     if title is None:
@@ -206,6 +210,9 @@ def plot_optim_stats(fid="output_optim.txt", path_out="./"):
 
     :type fid: str
     :param fid: path to the optimization stats file to plot
+    :type path_out: str
+    :param path_out: full path (no filename) to save figures. filenames will
+        be determined by the header values
     """
     header = open(fid).readlines()[0].strip().split(",")
     stats = np.loadtxt(fid, delimiter=",", skiprows=1).T

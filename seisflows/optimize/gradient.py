@@ -41,8 +41,8 @@ from seisflows.plugins import line_search as line_search_dir
 
 class Gradient:
     """
-    Gradient Optimization
-    ---------------------
+    Gradient Optimization [Optimize Base]
+    -------------------------------------
     Defines foundational structure for Optimization module. Applies a 
     gradient/steepest descent optimization algorithm.
 
@@ -112,8 +112,8 @@ class Gradient:
         # Hidden paths to store checkpoint file in scratch directory
         self.path["_checkpoint"] = os.path.join(self.path.scratch,
                                                 "checkpoint.npz")
-        self.path["_stats_file"] = os.path.join(self.path.output,
-                                                "output_optim.txt")
+        # Hidden path to export stats log and figures
+        self.path["_optim_output"] = os.path.join(self.path.output, "optimize")
 
         # Internal check to see if the chosen line search algorithm exists
         if not hasattr(line_search_dir, line_search_method):
@@ -136,6 +136,11 @@ class Gradient:
             line_search_dir, line_search_method.title())(
             step_count_max=step_count_max, step_len_max=step_len_max,
         )
+
+    def __str__(self):
+        """Quickly access underlying line search search history, mostly for
+        debug purposes"""
+        return self._line_search.__str__()
 
     @property
     def step_count(self):
@@ -173,6 +178,7 @@ class Gradient:
         Sets up nonlinear optimization machinery
         """
         unix.mkdir(self.path.scratch)
+        unix.mkdir(self.path._optim_output)
 
         # Load checkpoint (if resuming) or save current checkpoint
         self.load_checkpoint()
@@ -286,7 +292,7 @@ class Gradient:
             self._line_search.step_len_max = float(dict_in["step_len_max"])
             self._line_search.iteridx = list(dict_in["iteridx"])
         else:
-            logger.info("no optimization checkpoint found, assuming first run")
+            logger.info("no optimization checkpoint file, assume 1st iteration")
             self.checkpoint()
 
     def _precondition(self, q):
@@ -451,7 +457,8 @@ class Gradient:
                 else:
                     alpha = max_allowable_alpha
 
-        logger.info(f"step length `alpha` = {alpha:.3E}")
+        if alpha is not None:
+            logger.info(f"step length `alpha` = {alpha:.3E}")
     
         return alpha, status
 
@@ -462,18 +469,23 @@ class Gradient:
         `alpha`
 
         :type alpha: float
-        :param alpha: step length recommended by the line search.
-        :rtype: np.array
-        :return: trial model that can be used for line search evaluation
+        :param alpha: step length recommended by the line search. if None,
+            due to failed line search, then this function returns None
+        :rtype: np.array or NoneType
+        :return: trial model that can be used for line search evaluation or 
+            None if alpha is None
         """
-        # The new model is the old model plus a step with a given magnitude 
-        m_try = self.load_vector("m_new").copy()
-        p = self.load_vector("p_new")  # current search direction
+        if alpha is not None:
+            # The new model is the old model plus a step with a given magnitude 
+            m_try = self.load_vector("m_new").copy()
+            p = self.load_vector("p_new")  # current search direction
 
-        dm = alpha * p.vector  # update = step length * step direction
-        logger.info(f"updating model with `dm` (dm_min={dm.min():.2E}, "
-                    f"dm_max = {dm.max():.2E})")
-        m_try.update(vector=m_try.vector + dm)
+            dm = alpha * p.vector  # update = step length * step direction
+            logger.info(f"updating model with `dm` (dm_min={dm.min():.2E}, "
+                        f"dm_max = {dm.max():.2E})")
+            m_try.update(vector=m_try.vector + dm)
+        else:
+            m_try = None
 
         return m_try
 
@@ -494,9 +506,12 @@ class Gradient:
             for fid in ["m_old.npz", "f_old.txt", "g_old.npz", "p_old.npz"]:
                 unix.rm(os.path.join(self.path.scratch, fid))
 
-        # Needs to be run before shifting model in next step
-        self.write_stats()
-        plot_optim_stats(fid=self.path._stats_file, path_out=self.path.output)
+        # Export stats and figures to output, must run before shifting model
+        self.write_stats(fid=os.path.join(self.path._optim_output, 
+                                          "output_optim.txt"))
+        plot_optim_stats(fid=os.path.join(self.path._optim_output,
+                                          "output_optim.txt"),
+                         path_out=self.path._optim_output)
 
         logger.info("setting current model as previous model (new -> old)")
         # e.g., m_new.npz -> m_old.npz
@@ -607,12 +622,16 @@ class Gradient:
     
         return dict_out
 
-    def write_stats(self):
+    def write_stats(self, fid="./optim_optim.txt"):
         """
         Write stats to file so that we don't lose information to subsequent
-        iterations. File is written to `path._stats_file`
+        iterations. File is written to path._output_optim/fid
+
+        :type fid: str
+        :param fid: full path and filename to save the text file. defaults to
+            ./output_optim.txt
         """
-        logger.info(f"writing optimization stats: '{self.path._stats_file}'")
+        logger.info(f"writing optimization stats: '{fid}'")
 
         keys = ["misfit", "step_count",  "step_length", 
                 "grad_norm_L1", "grad_norm_L2",
@@ -622,12 +641,13 @@ class Gradient:
         # First time, write header information and start model misfit. Note that
         # most of the statistics do not apply to the starting model so they
         # are set to 0 by default
-        if not os.path.exists(self.path._stats_file):
-            with open(self.path._stats_file, "w") as f_:
+        if not os.path.exists(fid):
+            with open(fid, "w") as f_:
                 x, f  = self._line_search.get_search_history()
                 header = ",".join(keys) + "\n"
                 f_.write(header)
                 # Write values for first iteration
+                _write_vals = []
                 for key in keys:
                     if key == "step_length":
                         val = x[0]
@@ -635,12 +655,13 @@ class Gradient:
                         val = f[0]
                     else:
                         val = 0
-                    f_.write(f"{val:6.3E}")  
-                f_.write("\n")
+                    _write_vals.append(f"{val:6.3E}") 
+                stats_str = ",".join(_write_vals) + "\n"
+                f_.write(stats_str)  
 
         # Write stats for the current, finished, line search
         stats = self.get_stats()
-        with open(self.path._stats_file, "a") as f_:
+        with open(fid, "a") as f_:
             stats_str = [f"{stats[key]:6.3E}" for key in keys]
             stats_str = ",".join(stats_str) + "\n"
             f_.write(stats_str)

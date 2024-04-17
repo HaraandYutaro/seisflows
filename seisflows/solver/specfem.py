@@ -19,8 +19,8 @@ TODO
 """
 import os
 import sys
-import time
 import subprocess
+import time
 from concurrent.futures import ProcessPoolExecutor, wait
 from glob import glob
 
@@ -33,8 +33,8 @@ from seisflows.tools.specfem import getpar, setpar, check_source_names
 
 class Specfem:
     """
-    Solver SPECFEM
-    --------------
+    Solver SPECFEM [Solver Base]
+    ----------------------------
     Defines foundational structure for Specfem-based solver module. 
     Generalized SPECFEM interface to manipulate SPECFEM2D/3D/3D_GLOBE w/ Python
 
@@ -87,7 +87,8 @@ class Specfem:
     Paths
     -----
     :type path_data: str
-    :param path_data: path to any externally stored data required by the solver
+    :param path_data: path to any externally stored waveform data required for 
+        data-synthetic comparison
     :type path_specfem_bin: str
     :param path_specfem_bin: path to SPECFEM bin/ directory which
         contains binary executables for running SPECFEM
@@ -151,7 +152,8 @@ class Specfem:
             model_init=path_model_init,
             model_true=path_model_true,
         )
-        self.path.mainsolver = os.path.join(self.path.scratch, "mainsolver")
+        self.path["mainsolver"] = os.path.join(self.path.scratch, "mainsolver")
+        self.path["_solver_output"] = os.path.join(self.path.output, "solver")
 
         # Private internal parameters for keeping track of solver requirements
         self._parameters = []
@@ -173,9 +175,17 @@ class Specfem:
         self._required_binaries = ["xspecfem2D", "xmeshfem2D", "xcombine_sem",
                                    "xsmooth_sem"]
         self._acceptable_source_prefixes = ["SOURCE", "FORCE", "FORCESOLUTION"]
-        
-        # Empty variable that will need to be overwritten by SPECFEM3D_GLOBE
+
+        # Constants that will be referenced during simulations and file I/O.
+        # These should be overwritten by all child classes (3D, 3D_GLOBE)
+        self._fwd_simulation_executables = ["bin/xmeshfem2D", "bin/xspecfem2D"]
+        self._adj_simulation_executables = ["bin/xspecfem2D"]
+        self._absorb_wildcard = "absorb_*_*"
+        self._forward_array_wildcard = ""
+
+        # Empty variables that will need to be overwritten by SPECFEM3D/3D_GLOBE
         self._regions = None
+        self._export_vtk = False
 
     def check(self):
         """
@@ -226,11 +236,10 @@ class Specfem:
         model_type = getpar(key="MODEL",
                             file=os.path.join(self.path.specfem_data,
                                               "Par_file"))[1]
-        # !!! BC UNCOMMENT THIS !!!
-        # assert(model_type in self._available_model_types), (
-        #     f"SPECFEM Par_file parameter `model`='{model_type}' does not "
-        #     f"match acceptable model types: {self._available_model_types}"
-        #     )
+        assert(model_type in self._available_model_types), (
+            f"SPECFEM Par_file parameter `model`='{model_type}' does not "
+            f"match acceptable model types: {self._available_model_types}"
+            )
 
         # Make sure the initial model is set and actually contains files
         assert(self.path.model_init is not None and
@@ -279,8 +288,9 @@ class Specfem:
 
         Exports INIT/STARTING and TRUE/TARGET models to disk (output/ dir.)
         """
-        self._initialize_working_directories()
-        self._export_starting_models()
+        # Create the internal directory structure required for storing results
+        for pathname in ["_solver_output"]:
+            unix.mkdir(self.path[pathname])
 
         # Assign file extensions to be used for database file searching
         model_type = getpar(key="MODEL",
@@ -289,9 +299,12 @@ class Specfem:
         if "gll" in model_type:
             self._ext = ".bin"
         else:
-            logger.warning("no file model/kernel file extension found, this "
-                           "may cause critical issues when looking for files. "
-                           "check SPECFEM parameter `model`.")
+            logger.warning("no SPECFEM model type specified to define file "
+                           "extension, defaulting to '.bin'")
+            self._ext = ".bin"
+
+        self._initialize_working_directories()
+        self._export_starting_models()
 
     def check_model_values(self, path):
         """
@@ -529,8 +542,9 @@ class Specfem:
         """
         return "OUTPUT_FILES"
 
-    def forward_simulation(self, executables=None, save_traces=False,
-                           export_traces=False, save_forward=True, **kwargs):
+    def forward_simulation(self, save_traces=False,
+                           export_traces=False, save_forward_arrays=False,
+                           flag_save_forward=True, **kwargs):
         """
         Wrapper for SPECFEM binaries: 'xmeshfem?D' 'xgenerate_databases',
                                       'xspecfem?D'
@@ -540,12 +554,6 @@ class Specfem:
          .. note::
             SPECFEM3D/3D_GLOBE versions must overwrite this function
 
-        :type executables: list or None
-        :param executables: list of SPECFEM executables to run, in order, to
-            complete a forward simulation. This can be left None in most cases,
-            which will select default values based on the specific solver
-            being called (2D/3D/3D_GLOBE). It is made an optional parameter
-            to keep the function more general for inheritance purposes.
         :type save_traces: str
         :param save_traces: move files from their native SPECFEM output location
             to another directory. This is used to move output waveforms to
@@ -556,32 +564,31 @@ class Specfem:
         :param export_traces: export traces from the scratch directory to a more
             permanent storage location. i.e., copy files from their original
             location
-        :type save_forward: bool
-        :param save_forward: whether to turn on the flag for saving the forward
-            arrays which are used for adjoint simulations. Not required if only
-            running forward simulations.
+        :type save_forward_arrays: str
+        :param save_forward_arrays: relative path (relative to 
+            /scratch/solver/<source_name>/<model_database>) to move the forward 
+            arrays which are used for adjoint simulations. Mainly used for 
+            ambient noise adjoint tomography which requires multiple forward 
+            simulations prior to adjoint simulations, putting forward arrays 
+            at the risk of overwrite. Normal Users can leave this default.
+        :type flag_save_forward: bool
+        :param flag_save_forward: whether to turn on the flag for saving the 
+            forward arrays which are used for adjoint simulations. Not required 
+            if only running forward simulations.
         """
-        if executables is None:
-            executables = ["bin/xmeshfem2D", "bin/xspecfem2D"]
-
         unix.cd(self.cwd)
         setpar(key="SIMULATION_TYPE", val="1", file="DATA/Par_file")
-        setpar(key="SAVE_FORWARD", val=f".{str(save_forward).lower()}.",
+        setpar(key="SAVE_FORWARD", val=f".{str(flag_save_forward).lower()}.",
                file="DATA/Par_file")
 
         # Calling subprocess.run() for each of the binary executables listed
-        for exc in executables:
+        for exc in self._fwd_simulation_executables:
             # e.g., fwd_mesher.log
             stdout = f"fwd_{self._exc2log(exc)}.log"
             self._run_binary(executable=exc, stdout=stdout)
 
         # Error check to ensure that mesher and solver have been run succesfully
-        # !!! Temporarily removed check because SPECFEM2D does not create this
-        # !!! file
-        # _mesh = os.path.exists(os.path.join("OUTPUT_FILES", 
-        #                                     "output_mesher.txt"))
         _solv = bool(glob(os.path.join("OUTPUT_FILES", self.data_wildcard())))
-        #if not _mesh or not _solv:
         if not _solv:
             logger.critical(msg.cli(f"solver failed to produce expected files",
                             header="external solver error", border="="))
@@ -608,9 +615,32 @@ class Specfem:
                 src=glob(os.path.join("OUTPUT_FILES", self.data_wildcard())),
                 dst=save_traces
             )
+        # Save forward arrays to disk for later adjoint simulations. This is
+        # primarily used for ambient noise adjoint tomography when other
+        # forward simulations are required prior to the adjoint simulation,
+        # which would overwrite existing forward arrays
+        if save_forward_arrays:
+            # scratch/solver/<source_name>/<save_forward_arrays>
+            save_forward_arrays = os.path.join(self.cwd, save_forward_arrays)
+            if not os.path.exists(save_forward_arrays):
+                unix.mkdir(save_forward_arrays)
+            for glob_key in [self._forward_array_wildcard, 
+                             self._absorb_wildcard]:                                   
+                unix.mv(src=glob(os.path.join(self.model_databases, glob_key)),
+                        dst=save_forward_arrays)
 
-    def adjoint_simulation(self, executables=None, save_kernels=False,
-                           export_kernels=False):
+        # Delete unncessary visualization files which may be large. This is 
+        # only relevant for SPECFEM3D/3D_GLOBE, but will not throw errors for 2D
+        if self.prune_scratch:
+            logger.debug("prune scratch: removing '*.vt?' files from database")
+            unix.rm(glob(os.path.join(self.model_databases, 
+                                      "proc??????_*.vt?")))
+
+        logger.info(f"FINISH FORWARD SIMULATION: {self.source_name}")
+
+    def adjoint_simulation(self, save_kernels=False, export_kernels=False,
+                           load_forward_arrays=False, 
+                           del_loaded_forward_arrays=False, **kwargs):
         """
         Wrapper for SPECFEM binary 'xspecfem?D'
 
@@ -622,12 +652,6 @@ class Specfem:
          .. note::
             SPECFEM3D/3D_GLOBE versions must overwrite this function
 
-        :type executables: list or None
-        :param executables: list of SPECFEM executables to run, in order, to
-            complete an adjoint simulation. This can be left None in most cases,
-            which will select default values based on the specific solver
-            being called (2D/3D/3D_GLOBE). It is made an optional parameter
-            to keep the function more general for inheritance purposes.
         :type save_kernels: str
         :param save_kernels: move the kernels from their native SPECFEM output
             location to another path. This is used to move kernels to another
@@ -639,10 +663,18 @@ class Specfem:
             directory to a more permanent storage location. i.e., copy files
             from their original location. Note that kernel file sizes are LARGE,
             so exporting kernels can lead to massive storage requirements.
+        :type load_forward_arrays: str
+        :param load_forward_arrays: relative path (relative to solver.cwd) to 
+            load previously generated forward arrays which are used for adjoint 
+            simulations. Mainly used for ambient noise adjoint tomography. Will 
+            OVERWRITE any forward array files already located in the database 
+            directory.
+        :type del_loaded_forward_arrays: bool
+        :param del_loaded_forward_arrays: only used if `load_forward_arrays` is
+            set. After adjoint simulation completes nominally, delete the 
+            forward arrays that were used to run the adjoint simulation to 
+            save space. Usually
         """
-        if executables is None:
-            executables = ["bin/xspecfem2D"]
-
         unix.cd(self.cwd)
 
         setpar(key="SIMULATION_TYPE", val="3", file="DATA/Par_file")
@@ -651,8 +683,32 @@ class Specfem:
         unix.rm("SEM")
         unix.ln("traces/adj", "SEM")
 
+        # Pre-load forward arrays if necessary
+        if load_forward_arrays:
+            logger.info(f"loading forward arrays: '{load_forward_arrays}'")
+            
+            # scratch/solver/<source_name>/<load_forward_arrays>
+            load_forward_arrays = os.path.join(self.cwd, load_forward_arrays)
+
+            # Few sanity checks to make sure something is actually loaded
+            if not os.path.exists(load_forward_arrays):
+                logger.critical(f"forward arrays not found: "
+                                f"{load_forward_arrays}")
+                sys.exit(-1)
+            if not glob(os.path.join(load_forward_arrays, "*")):
+                logger.critical(f"forward array's empty {load_forward_arrays}")
+                sys.exit(-1)
+            
+            # 'cp' command will OVERWRITE existing forward arrays in the dir.
+            for fwd_arr in glob(os.path.join(load_forward_arrays, "*")):
+                fid = os.path.basename(fwd_arr)
+                unix.cp(src=fwd_arr, dst=os.path.join(self.cwd, 
+                                                      self.model_databases, 
+                                                      fid)
+                        )
+
         # Calling subprocess.run() for each of the binary executables listed
-        for exc in executables:
+        for exc in self._adj_simulation_executables:
             # e.g., adj_solver.log
             stdout = f"adj_{self._exc2log(exc)}.log"
             logger.info(f"running SPECFEM executable {exc}, log to '{stdout}'")
@@ -691,6 +747,23 @@ class Specfem:
                                     f"please check adjoint solver log for "
                                     f"{self.source_name}")
                     sys.exit(-1)
+
+        # Working around fact that `absorb_buffer` files have diff naming w.r.t
+        # SPECFEM3D. Will also remove `save_forward_arrays` to free up space
+        # since we no longer need these
+        if self.prune_scratch:                                                   
+            for glob_key in [self._forward_array_wildcard, 
+                             self._absorb_wildcard]:
+                logger.debug(f"prune scratch: removing '{glob_key}' files"
+                             f"from database ")                                  
+                unix.rm(glob(os.path.join(self.model_databases, glob_key)))
+
+        if load_forward_arrays and del_loaded_forward_arrays:
+            logger.debug(f"removing loaded forward arrays: "
+                         f"{load_forward_arrays}")
+            unix.rm(load_forward_arrays)
+
+        logger.info(f"FINISH ADJOINT SIMULATION: {self.source_name}")
 
     def _rename_kernel_parameters(self):
         """
@@ -760,7 +833,7 @@ class Specfem:
             exc = f"bin/xcombine_sem {name} kernel_paths {output_path}"
             # e.g., smooth_vp.log
             stdout = f"{self._exc2log(exc)}_{name}.log"
-            self._run_binary(executable=exc, stdout=stdout)
+            self._run_binary(executable=exc, stdout=stdout, with_mpi=True)
 
     def smooth(self, input_path, output_path, parameters=None, span_h=None,
                span_v=None, use_gpu=False):
@@ -817,7 +890,7 @@ class Specfem:
                    f"{input_path} {output_path} {use_gpu}")
             # e.g., combine_vs.log
             stdout = f"{self._exc2log(exc)}_{name}.log"
-            self._run_binary(executable=exc, stdout=stdout)
+            self._run_binary(executable=exc, stdout=stdout, with_mpi=True)
 
         # Rename output files to remove the '_smooth' suffix which SeisFlows
         # will not recognize
@@ -944,8 +1017,7 @@ class Specfem:
         source_paths = [p for p in source_paths if not os.path.exists(p)]
 
         if source_paths:
-            logger.info(f"initializing {self.ntask} solver directories "
-                        f"{max_workers} at a time")
+            logger.info(f"initializing {self.ntask} solver directories")
 
         if max_workers > 1:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -998,7 +1070,8 @@ class Specfem:
         else:
             source_name = os.path.basename(cwd)
 
-        logger.debug(f"initializing solver directory source: {source_name}")
+        _idx = self.source_names.index(source_name)
+        logger.debug(f"source {_idx}: {source_name}")
         # Starting from a fresh working directory
         unix.rm(cwd)
         unix.mkdir(cwd)
@@ -1053,3 +1126,108 @@ class Specfem:
             for par in parameters:
                 src = glob(os.path.join(model, f"*{par}{self._ext}"))
                 unix.cp(src, dst)
+
+    def make_output_vtk_files(self, input_path, output_path=None, 
+                              parameters=None, hi_res=False, tag=None, 
+                              kernel=False):
+        """
+        A warpper on `combine_vol_data_vtk()` that automatically tries to 
+        generate .vtk files using the SPECFEM binary xcombine_vol_data_vtk, 
+        and rename the output files to not be so generic. Files will be stored
+        in the `output_path` directory, and will be named based on the `tag` 
+        unless overwritten by the User.
+
+        :type input_path: str
+        :param input_path: path to database files to be summed.
+        :type output_path: strs
+        :param output_path: path to export the outputs of the binary
+        :type parameters: list
+        :param parameters: optional list of parameters, defaults to 
+            `self._parameters` if None provided (e.g., ['vp', 'vs'])
+        :type tag: str
+        :param tag: optional tag to rename output vtk files. If not provided,
+            will use the name of the directory holding the files
+        :type kernel: bool
+        :param kernel: whether the files being converted are kernel files or
+            model files. This changes the file naming convention
+        :type hi_res: bool
+        :param hi_res: Set the high resolution flag to 1 or True, which will
+            generate .vtk files with data at EACH GLL point, rather than at each
+            nodal vertex. These files are LARGE, and we discourage using
+            `hi_res`==True unless you know you want these files.
+        """
+        # Check that we are using the correct Solver type (3D, 3D_GLOBE)
+        if not hasattr(self, "combine_vol_data_vtk"):
+            logger.warning("solver does not have the capability to generate "
+                           "VTK files, skipping")
+            return
+        elif not os.path.exists(os.path.join(self.path.specfem_bin, 
+                                             "xcombine_vol_data_vtk")):
+            logger.warning("solver does not have the required binary "
+                           "'xcombine_vol_data_vtk', please compile this "
+                           "binary to make VTK files. Skipping ")
+            return
+        
+        # Set some default parameters if not overwritten by User
+        if not output_path:
+            output_path = os.path.join(self.path._solver_output, "VTK")
+
+        # Determine how to rename files after creation
+        if not tag:
+            tag = os.path.basename(input_path)
+        
+        # Set which parameters will be made into VTK files. Do not re-create
+        # files that already exist. Add '_kernel' for kernel and gradient files
+        if not parameters:
+            parameters = []
+            for par in self._parameters:
+                if kernel:
+                    par = f"{par}_kernel"
+                # Strip reg?_ from SPECFEM3D_GLOBE parameter names
+                # e.g., reg1_vsh -> vsh
+                if self._regions:
+                    par = par[5:]
+                # File naming should follow a standard format that we validate
+                check = glob(os.path.join(output_path, f"{tag}*{par}.vtk"))
+                if not check:
+                    parameters.append(par)
+                else:
+                    continue
+        if not parameters:
+            return
+        
+        self.combine_vol_data_vtk(
+            input_path=input_path, output_path=output_path, 
+            parameters=parameters, hi_res=hi_res
+            )
+        # Wait for the process to finish before trying to rename files
+        time.sleep(5 * len(parameters))
+        
+            # SPECFEM3D_GLOBE will tag files based on region
+        for par in parameters:
+            if self._regions is not None:
+                for region in self._regions:
+                    src = os.path.join(output_path, f"reg_{region}_{par}.vtk")
+                    dst = os.path.join(
+                        output_path, f"{tag}_reg_{region}_{par}.vtk")
+                    if os.path.exists(src):
+                        unix.mv(src, dst)
+            else:
+                src = os.path.join(output_path, f"{par}.vtk")
+                dst = os.path.join(output_path, f"{tag}_{par}.vtk")
+                if os.path.exists(src):
+                    unix.mv(src, dst)
+
+    def finalize(self):
+        """
+        General finalization procedures for SPECFEM-based solver activities
+        """
+        # Generate VTK files for everything in output path
+        if self._export_vtk:
+            for name in ["MODEL", "GRADIENT"]:
+                for fid in glob(os.path.join(self.path.output, f"{name}_*")):
+                    self.make_output_vtk_files(
+                        input_path=fid, kernel=bool(name=="GRADIENT")
+                        )
+        
+

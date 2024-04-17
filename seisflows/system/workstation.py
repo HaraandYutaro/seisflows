@@ -8,18 +8,19 @@ import os
 import sys
 import subprocess
 import time
+import numpy as np
 from contextlib import redirect_stdout
 
 from seisflows import logger
-from seisflows.tools import unix
+from seisflows.tools import unix, msg
 from seisflows.tools.config import Dict, import_seisflows
 from seisflows.tools.config import copy_file, set_task_id
 
 
 class Workstation:
     """
-    Workstation System
-    ------------------
+    Workstation System [System Base]
+    --------------------------------
     Defines foundational structure for System module. When used standalone,
     runs solver tasks either in serial (if `nproc`==1; i.e., without MPI) or in
     parallel (if `nproc`>1; i.e., with MPI). All other tasks are run in serial.
@@ -156,6 +157,7 @@ class Workstation:
                 logger.critical(f"`array` argument can not be parsed by System "
                                 f"module. Please check error message: {e}")
                 sys.exit(-1)
+            logger.info(f"`system.array` == {self.array}")
     
         assert(isinstance(self.rerun, int)), f"`rerun` must be an int [0,inf)"
         assert(self.rerun >= 0), f"`rerun` must be in bounds [0, inf)"

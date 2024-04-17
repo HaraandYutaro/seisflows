@@ -20,6 +20,7 @@ model
 import os
 import sys
 import shutil
+import numpy as np
 from glob import glob
 from seisflows import logger
 from seisflows.tools import msg, unix
@@ -60,11 +61,6 @@ class Migration(Forward):
                  export_kernels=False, **kwargs):
         """
         Instantiate Migration-specific parameters
-
-        :type modules: list
-        :param modules: list of sub-modules that will be established as class
-            attributes by the setup() function. Should not need to be set by the
-            user
         """
         super().__init__(**kwargs)
 
@@ -100,7 +96,8 @@ class Migration(Forward):
                 self.evaluate_initial_misfit,
                 self.run_adjoint_simulations,
                 self.postprocess_event_kernels,
-                self.evaluate_gradient_from_kernels
+                self.evaluate_gradient_from_kernels,
+                self.finalize_iteration,
                 ]
 
     def run_adjoint_simulations(self, **kwargs):
@@ -114,9 +111,7 @@ class Migration(Forward):
             general by allowing other workflows to include pre- and post-
             processing tasks, or to overwrite the adjoint simulation task
         """
-        logger.info(msg.mnr("EVALUATING EVENT KERNELS W/ ADJOINT SIMULATIONS"))
         self.system.run([self._run_adjoint_simulation_single], **kwargs)
-
 
     def _run_adjoint_simulation_single(self, save_kernels=None, 
                                        export_kernels=None, **kwargs):
@@ -129,6 +124,11 @@ class Migration(Forward):
 
             Must be run by system.run() so that solvers are assigned
             individual task ids/working directories.
+
+        .. note:: 
+
+            see solver.specfem.adjoint_simulation() for full 
+            detailed list of input parameters
 
         :type save_kernels: str
         :param save_kernels: path to a directory where kernels created by the 
@@ -158,14 +158,15 @@ class Migration(Forward):
         # Run adjoint simulations on system. Make kernels discoverable in
         # path `eval_grad`. Optionally export those kernels
         self.solver.adjoint_simulation(save_kernels=save_kernels,
-                                       export_kernels=export_kernels)
+                                       export_kernels=export_kernels,
+                                       **kwargs)
 
     def postprocess_event_kernels(self):
         """
         Combine/sum NTASK event kernels into a single volumetric kernel and
         then (optionally) smooth the output misfit kernel by convolving with
         a 3D Gaussian function with user-defined horizontal and vertical
-        half-widths.
+        half-widths, or by using the laplacian smoothing operator.
 
         .. note::
 
@@ -173,13 +174,67 @@ class Migration(Forward):
             your kernels may be zero due to something going awry in the
             misfit quantification or adjoint simulations.
         """
-        def combine_event_kernels(**kwargs):
-            """Combine event kernels into a misfit kernel"""
-            logger.info("combining event kernels into single misfit kernel")
+        def mask_source_event_kernels(**kwargs):
+            """
+            Mask source region by combining binary source mask with kernel.
+            This feature is only available in SPECFEM3D_GLOBE and only turned on
+            if solver.mask_source is set to True, otherwise it will be skipped.
 
+            This uses the Model class because SPECFEM does not have an internal
+            function for multiplying files (only for adding/subtracting)
+            """
+            # Only trigger this function if the Solver saved source mask files
+            mask_path = os.path.join(self.path.eval_grad, "mask_source", 
+                                     self.solver.source_names[0])
+            if not glob(os.path.join(mask_path, "*")):
+                logger.debug("no source mask files found, skipping source mask")
+                return
+            
+            logger.info("masking source region in event kernels")
+            for src in self.solver.source_names:
+                logger.debug(f"mask source {src}")
+                path = os.path.join(self.path.eval_grad, "mask_source", src)
+
+                # Mask vector [0, 1], where values <1 are near source
+                mask_model = Model(path=path, parameters=["mask_source"],
+                                   regions=self.solver._regions)
+                
+                # Gaussian mask sometimes does not sufficiently suppress source 
+                # region so we modify the amplitude 
+                maskv = mask_model.vector
+                if self.solver.scale_mask_region:
+                    logger.info(f"scaling source mask by "
+                                f"{self.solver.scale_mask_region}")
+                    maskv[maskv < 1] *= self.solver.scale_mask_region  
+
+                # Need to expand vector the length of the event kernel vector
+                maskv = np.tile(maskv, len(self.solver._parameters))
+                
+                # Now we apply the mask to the event kernel which contains all
+                # parameters we are updating in our inversion
+                event_kernel = Model(
+                    path=os.path.join(self.path.eval_grad, "kernels", src), 
+                    parameters=[f"{par}_kernel" for par in 
+                                self.solver._parameters],
+                    regions=self.solver._regions
+                    )
+                event_kernel.update(vector=event_kernel.vector * maskv)
+
+                # Overwrite existing event kernel files with the masked version
+                event_kernel.write(
+                    path=os.path.join(self.path.eval_grad, "kernels", src)
+                    )
+
+        def combine_event_kernels(**kwargs):
+            """
+            Combine individual event kernels into a misfit kernel for each
+            parameter defined by the solver
+            """
             # Input paths are the kernels generated by each of the sources
             input_paths = [os.path.join(self.path.eval_grad, "kernels", src) for
                            src in self.solver.source_names]
+
+            logger.info("combining event kernels into single misfit kernel")
 
             # Parameters to combine are the kernels, which follow the 
             # naming convention {par}_kernel
@@ -192,7 +247,9 @@ class Migration(Forward):
             )
 
         def smooth_misfit_kernel(**kwargs):
-            """Smooth the output misfit kernel"""
+            """
+            Smooth the misfit kernel using the underlying Solver smooth function
+            """
             if self.solver.smooth_h > 0. or self.solver.smooth_v > 0.:
                 logger.info(
                     f"smoothing misfit kernel: "
@@ -216,9 +273,8 @@ class Migration(Forward):
             if os.path.exists(scratch_path):
                 shutil.rmtree(scratch_path)
 
-        logger.info(msg.mnr("GENERATING/PROCESSING MISFIT KERNEL"))
-        self.system.run([combine_event_kernels, smooth_misfit_kernel],
-                        single=True)
+        self.system.run([mask_source_event_kernels, combine_event_kernels, 
+                         smooth_misfit_kernel], single=True)
 
     def evaluate_gradient_from_kernels(self):
         """
@@ -229,8 +285,6 @@ class Migration(Forward):
         :raises SystemError: if the gradient vector is zero, which means that
             none of the kernels returned usable values.
         """
-        logger.info("scaling gradient to absolute model perturbations")
-
         # Check that kernel files exist before attempting to manipulate
         misfit_kernel_path = os.path.join(self.path.eval_grad, "misfit_kernel")
         if not glob(os.path.join(misfit_kernel_path, "*")):
@@ -260,6 +314,7 @@ class Migration(Forward):
 
         # Merge to vector and convert to absolute perturbations:
         # log dm --> dm (see Eq.13 Tromp et al 2005)
+        logger.info("scaling gradient to absolute model perturbations")
         gradient.update(vector=gradient.vector * model.vector)
         gradient.write(path=os.path.join(self.path.eval_grad, "gradient"))
 
@@ -277,7 +332,7 @@ class Migration(Forward):
         if self.export_gradient:
             logger.info("exporting gradient to disk")
             src = os.path.join(self.path.eval_grad, "gradient")
-            dst = os.path.join(self.path.output, "gradient")
+            dst = os.path.join(self.solver.path.output, "gradient")
             unix.cp(src, dst)
 
         # Last minute check to see if the gradient is 0. If so then the adjoint

@@ -27,8 +27,8 @@ from seisflows.preprocess.default import read, initialize_adjoint_traces
 
 class Pyaflowa:
     """
-    Pyaflowa Preprocess
-    -------------------
+    Pyaflowa Preprocess [Preprocess Base]
+    -------------------------------------
     Preprocessing and misfit quantification using Python's Adjoint Tomography
     Operations Assistant (Pyatoa)
 
@@ -36,7 +36,7 @@ class Pyaflowa:
     ----------
     :type min_period: float
     :param min_period: Minimum filter corner in unit seconds. Bandpass
-    filter if set with `max_period`, highpass filter if set without
+        filter if set with `max_period`, highpass filter if set without
     `max_period`, no filtering if not set and `max_period also not set
     :type pyflex_parameters: dict
     :param pyflex_parameters: overwrite for Pyflex parameters defined
@@ -60,6 +60,14 @@ class Pyaflowa:
         each iteration (e.g., i01s00... i02s00...
         'ONCE': Calculate new windows at first evaluation of
         the workflow, i.e., at self.par.BEGIN
+    :type revalidate: bool
+    :param revalidate: Only used if `fix_windows` is True, ITER or ONCE. Windows
+        that are retrieved from datasets will be revalidated against parameters
+        in the Config object (ccshift, dlna, etc.), and rejected if they fall 
+        outside defined bounds. If False, windows will not be revalidated. 
+        Caution is advised with this parameter as event misfit may be 
+        artificially reducedby removing a significant number of windows, which
+        is possible when `revalidate`==True
     :type adj_src_type: str
     :param adj_src_type: Adjoint source type to evaluate misfit, defined by
         Pyadjoint. See `pyadjoint.config.ADJSRC_TYPES` for detailed options list
@@ -98,8 +106,9 @@ class Pyaflowa:
     """
     def __init__(self, min_period=1., max_period=10.,
                  pyflex_parameters=None, pyadjoint_parameters=None,
-                 fix_windows=False, adj_src_type="cc_traveltime",
-                 plot_waveforms=True, preprocess_log_level="DEBUG",
+                 fix_windows=False, revalidate=False, 
+                 adj_src_type="cc_traveltime", plot_waveforms=True, 
+                 preprocess_log_level="DEBUG",
                  export_datasets=True, export_figures=True,
                  export_log_files=True, workdir=os.getcwd(),
                  path_preprocess=None, path_solver=None, path_specfem_data=None,
@@ -144,6 +153,7 @@ class Pyaflowa:
         self.min_period = min_period
         self.max_period = max_period
         self.fix_windows = fix_windows
+        self.revalidate = revalidate
         self.adj_src_type = adj_src_type
         self.plot_waveforms = plot_waveforms
         self.preprocess_log_level = preprocess_log_level
@@ -182,6 +192,8 @@ class Pyaflowa:
         self.path["_tmplogs"] = os.path.join(self.path._logs, "tmp")
         self.path["_datasets"] = os.path.join(self.path.scratch, "datasets")
         self.path["_figures"] = os.path.join(self.path.scratch, "figures")
+        self.path["_preproc_output"] = os.path.join(self.path.output, 
+                                                    "preprocess")
 
         # Parameters that are defined by other modules but accessed by Pyaflowa
         self.syn_data_format = syn_data_format.upper()
@@ -242,7 +254,7 @@ class Pyaflowa:
         """
         # Create the internal directory structure required for storing results
         for pathname in ["scratch", "_logs", "_tmplogs", "_datasets",
-                         "_figures"]:
+                         "_figures", "_preproc_output"]:
             unix.mkdir(self.path[pathname])
 
         if self._data_case == "synthetic":
@@ -396,6 +408,8 @@ class Pyaflowa:
         # Collect all temp log files into a single log file
         self._finalize_logging(config, total_windows, total_misfit)
 
+        logger.info(f"FINISH QUANTIFY MISFIT: {source_name}")
+
     def _setup_quantify_misfit(self, source_name, save_adjsrcs=None,
                                components=None):
         """
@@ -442,9 +456,12 @@ class Pyaflowa:
         """
         # READ DATA
         # Event metadata from SPECFEM DATA/ (CMTSOLUTION, FORCESOLUTION etc.)
+        # TEMPORARY suppress warnings to avoid PySEP warning about some sources
+        # not having an origin time. This should be removed after a PySEP update
+        # to not throw this warning
         cat = read_events_plus(
             fid=os.path.join(self.path.specfem_data,
-                             f"{self._source_prefix}_{config.event_id}"),
+                            f"{self._source_prefix}_{config.event_id}"),
             format=self._source_prefix
         )
         # Waveform input; `origintime` will only be applied if format=='ASCII'
@@ -524,6 +541,10 @@ class Pyaflowa:
             # !!! HARDCODE NORMALIZATION FOR ANAT, REMOVE THIS !!!
             mgmt.preprocess(remove_response=False, normalize_to="syn")
             if fix_windows:
+                # Determine components from waveforms on the fly so that we can
+                # use that information to only select windows we need
+                components = [tr.stats.component for tr in mgmt.st_syn]
+
                 # Retrieve windows from the last available evaluation. Wrap in
                 # try-except block incase file lock is in place by other procs.
                 while True:
@@ -532,7 +553,10 @@ class Pyaflowa:
                                 os.path.join(self.path["_datasets"],
                                              f"{config.event_id}.h5"),
                                 mode="r") as ds:
-                            mgmt.retrieve_windows_from_dataset(ds=ds)
+                            mgmt.retrieve_windows_from_dataset(
+                                    ds=ds, components=components,
+                                    revalidate=self.revalidate
+                                    )
                         break
                     except (BlockingIOError, FileExistsError):
                         # Random sleep time [0,1]s to decrease chances of two
@@ -544,7 +568,7 @@ class Pyaflowa:
                 mgmt.window()
             mgmt.measure()
         except Exception as e:
-            station_logger.warning(e)
+            station_logger.critical(f"FLOW FAILED: {e}")
             pass
 
         # Plot waveform + map figure. Map may fail if we don't have appropriate
@@ -595,12 +619,17 @@ class Pyaflowa:
         more permanent output/ directory. Scratch files are deleted during 
         this operation to free up disk space.
         """
+        # Create or overwrite the Inspector CSVs used for inversion review
+        insp = Inspector()
+        insp.discover(path=self.path._datasets)
+        insp.save(path=self.path._preproc_output)
+
         # Move scratch/ directory results into more permanent storage. Do not
         # bomb out datasets because we use them to store window information
         if self.export_datasets:
             src = glob(os.path.join(self.path._datasets, "*.h5"))
             src += glob(os.path.join(self.path._datasets, "*.csv"))  # inspector
-            dst = os.path.join(self.path.output, "pyaflowa", "datasets", "")
+            dst = os.path.join(self.path._preproc_output, "datasets", "")
             unix.mkdir(dst)
             unix.cp(src, dst)
 
@@ -627,7 +656,7 @@ class Pyaflowa:
 
             # Save figure files to output (if requested)
             src = glob(os.path.join(self.path._figures, "i??s??"))
-            dst = os.path.join(self.path.output, "pyaflowa", "figures", "")
+            dst = os.path.join(self.path._preproc_output, "figures", "")
             unix.mkdir(dst)
             unix.mv(src, dst)
 
@@ -652,7 +681,7 @@ class Pyaflowa:
                 unix.mv(src, dst)
 
             src = glob(os.path.join(self.path._logs, "i??s??"))
-            dst = os.path.join(self.path.output, "pyaflowa", "logs", "")
+            dst = os.path.join(self.path._preproc_output, "logs", "")
             unix.mkdir(dst)
             unix.mv(src, dst)
 
@@ -660,7 +689,7 @@ class Pyaflowa:
         unix.rm(self.path._figures)
         unix.mkdir(self.path._figures)
 
-        # Bomb out the scratch directory regardless of export status
+        # Bomb out the log files regardless of export status
         unix.rm(self.path._logs)
         unix.mkdir(self.path._logs)
         unix.mkdir(os.path.join(self.path._logs, "tmp"))
@@ -739,10 +768,10 @@ class Pyaflowa:
             the given file defined by `fid`
         """
         handler = logging.FileHandler(fid, mode="w")
-        logfmt = "[%(asctime)s] - %(name)s - %(levelname)s: %(message)s"
+        logfmt = "%(asctime)s [%(name)s %(levelname).4s] | %(message)s"
         formatter = logging.Formatter(logfmt, datefmt="%Y-%m-%d %H:%M:%S")
         handler.setFormatter(formatter)
-        for log in ["pyflex", "pyadjoint", "pyatoa", "pysep"]:
+        for log in ["pyflex", "pyadjoint", "pysep", "pyatoa"]:
             # Set the overall log level
             logger = logging.getLogger(log)
             # Turn off any existing handlers (stream and file)

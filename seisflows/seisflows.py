@@ -19,6 +19,7 @@ import sys
 import argparse
 from glob import glob
 from inspect import getmro
+
 from seisflows import logger, ROOT_DIR, NAMES, __version__
 from seisflows.tools import unix, msg
 from seisflows.tools.config import load_yaml, custom_import, import_seisflows
@@ -588,7 +589,7 @@ class SeisFlows:
         unix.cp(self._args.parameter_file, temp_par_file)
 
         try:
-            written, path_docstrings = [], []
+            written = []
             f = open(self._args.parameter_file, "a")
             # Write all module parameters and corresponding docstrings
             for module in modules:
@@ -622,8 +623,9 @@ class SeisFlows:
                     elif key in _ignore_paths:
                         continue
                     # Don't write default paths yet, will write at the end
-                    elif key in _default_paths and key not in defaults:
-                        defaults[key] = val
+                    elif key in _default_paths:
+                        if key not in defaults:
+                            defaults[key] = val
                         continue
                     
                     if val is None:
@@ -632,6 +634,8 @@ class SeisFlows:
                         val = os.path.abspath(val)
                     else:
                         val = os.path.relpath(val)
+                    if key == "scratch":
+                        import pdb;pdb.set_trace()
                     f.write(f"path_{key}: {val}\n")
                     written.append(key)
             # Write out the default paths at the very end
@@ -696,7 +700,6 @@ class SeisFlows:
                            delim=":")
             return
             
-
         if module not in NAMES:
             print(msg.cli(text=f"{module} does not match {NAMES}",
                           header="error"))
@@ -707,7 +710,7 @@ class SeisFlows:
         unix.mv(self._args.parameter_file, f"_{self._args.parameter_file}")
         try:
             # Create a new parameter file with updated module
-            self.setup(force=True)
+            self.init(force=True)
             for name in NAMES:
                 setpar(key=name, val=ogpars[name],
                        file=self._args.parameter_file, delim=":")
@@ -785,6 +788,7 @@ class SeisFlows:
 
         parameters = load_yaml(self._args.parameter_file)
         system = custom_import("system", parameters.system)(**parameters)
+
         if self._args.direct is True:
             try:
                 system.submit(workdir=self._args.workdir,
@@ -827,11 +831,15 @@ class SeisFlows:
 
         if check == "y":
             pars = load_yaml(self._args.parameter_file)
-            for name in ["scratch", "output", "log_files", "state_file", 
-                         "output_log"]:
+            for name in ["scratch", "output", "log_files", 
+                         "state_file", "output_log"]:
                 path = f"path_{name}"
                 if path in pars:
                     unix.rm(pars[path])
+            # Special case for data path, only delete if it's empty
+            if not os.listdir(pars["path_data"]):
+                unix.rm(pars["path_data"])
+
 
     def restart(self, force=False, **kwargs):
         """
@@ -848,23 +856,20 @@ class SeisFlows:
         Does not allow stepping through of code (not a breakpoint).
         """
         from IPython import embed
-
         workflow = import_seisflows(workdir=self._args.workdir,
-                                    parameter_file=self._args.parameter_file)
+                            parameter_file=self._args.parameter_file)
+        
+        logger.info(msg.mjr("ENTERING DEBUG MODE"))
+        print(msg.cli(
+            "SeisFlows' debug mode is an embedded IPython environment. All "
+            "modules are loaded by default and can be accessed by name "
+            "(e.g., workflow, solver, optimize, etc.)", border="-")
+            )
 
         # Break out sub-modules and parameters so they're more easily accesible
+        # within debug mode
         parameters = load_yaml(self._args.parameter_file)
         system, solver, preprocess, optimize = workflow._modules.values()
-
-        print("Loaded SeisFlows Modules:")
-        for module in [workflow, system, solver, preprocess, optimize]:
-            print(f"{module.__class__}")
-
-        print(msg.cli("SeisFlows' debug mode is an embedded IPython "
-                      "environment. All modules are loaded by default. "
-                      "To save changes made, type: 'workflow.checkpoint()'. "
-                      "To exit debug mode, type: 'exit()'",
-                      header="debug", border="="))
 
         embed(colors="Neutral")
 
@@ -937,7 +942,7 @@ class SeisFlows:
         # formatted the same as the rest of the file
         if parameter == "VELOCITY_MODEL":
             key = parameter
-            items = getpar_vel_model(file=par_file)
+            items = getpar_vel_model(file=par_file, strip=True)
             cur_val = ""
         else:
             try:
@@ -957,7 +962,7 @@ class SeisFlows:
                 setpar_vel_model(file=par_file, model=value.split("+"))
                 if not skip_print:
                     items.append("->")
-                    items += getpar_vel_model(file=par_file)
+                    items += getpar_vel_model(file=par_file, strip=True)
                     print(msg.cli(f"{key}:", items=items))
             else:
                 setpar(key=parameter, val=value, file=par_file, delim="=")
@@ -1212,7 +1217,7 @@ class SeisFlows:
         plot_model.coordinates = base_model.coordinates
         # plot2d has internal check for acceptable parameter value
         plot_model.plot2d(parameter=parameter, cmap=cmap, show=True,
-                          title=f"{name} // {parameter.upper()}", save=savefig)
+                          title=f"{name} // {parameter}", save=savefig)
 
     def reset(self, choice=None, **kwargs):
         """

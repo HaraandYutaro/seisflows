@@ -1,4 +1,51 @@
-### Major Changes
+# CHANGELOG
+
+## v3.1.0 (#208)
+Bugfix NoiseInversion Workflow 
+
+### Main Fix
+- Solver defines filename wildcards for requisite forward array files that are used for adjoint simulations. These are used to save forward arrays during noise inversion workflow
+- Solver.forward_simulation() now has new parameter `save_forward_arrays` that User can use to specify location to save arrays relative to the solver working directory. Should not be required for other workflows
+- Solver.adjoint_simulation() now has the ability to `load_forward_arrays` by specifying path which should correspond to the forward simulation save_forward_arrays parameter. 
+- Solver.adjoint_simulation() has the ability to `del_loaded_forward_arrays` to free up memory after adjoint simulation completes successfully
+- 
+### Misc.
+- Solver executables for each version of SPECFEM (2D/3D/3D_GLOBE) are now defined as internal variables in `__init__` rather than at the top of each corresponding function, making it clearer and easier to overwrite 
+- API Change: change default directory name `path_data=='waveforms'` (previously 'data') to avoid confusion with SPECFEM DATA/ directory and SeisFlows SFDATA/ directory. 
+- Workflow.NoiseInversion class now check sfor correct SPECFEM parameter that mandates using forcesolutions
+- Work In Progress: Started writing machinery for generating combined adjoint kernel but this is incomplete and will throw a NotImplementedError
+- Preprocess modules now logs a 'completed' statement to make it clear that the process has finished successfully
+- Modified additional log messages for brevity or to stand out more in the main log file
+
+
+## v3.0.2 (#204)
+System Wisteria GPU Upgrades
+
+- Bugfix: Fujitsu tasktime for individual job submission was using `walltime` value, not `tasktime` value
+- Combined and condensed main System functionality in Fujitsu system from Wisteria child class. Prior to this Wisteria child class was overwriting most of the functionality of Fujitsu which is not really the point of inheritance
+- New Custom Run and Submit scriopts for Wisteria GPU. Better comments and slightly easier to modify for others
+- Added new `rscgrps` to include GPU partitions on Wisteria
+- Improved run call header for easier switching between CPU and GPU nodes
+
+## v3.0.1 (#203) 
+Quality of Life Updates
+
+- Solver now automatically generates VTK files for Models and Gradients at the end of each iteration
+    - New function `solver.specfem.make_output_vtk_files` that generates .vtk files for all files in the output/ directory
+    - solver.finalize() runs `make_output_vtk_files` at the end of each iteration
+    - new solver parameter `export_vtk` controls whether the above option is run, default to True, only available for SPECFEM3D/3D_GLOBE
+- Improve organization for files exported to `path_output` 
+    - Optimization stats file and figures saved the `workdir/output/optimize` whereas before they were saved directly to output/
+    - Changed pyaflowa export directory to `workdir/output/preprocess` (before it was `workdir/output/pyaflowa`)
+- Quality of Life Updates
+    - `path_data` directory is deleted by `seisflows clean` iff empty, since it is created by solver.setup()
+    - Logging updates: better visual demarcation of workflow tasks, headers relate to workflow function run
+    - `seisflows debug` has a cleaner log message
+    - shuffled workflow finalization procedures so that base class (forward) contains standard finalization procedures
+- Bugfix
+    - Uncommented gll model check which had been commented for devel purposes
+
+## v3.0.0
 - Workflow:
     - State file changed states from words to integers (completed -> 1, 
       failed -> -1, pending -> 0), and full state file is created at workflow
